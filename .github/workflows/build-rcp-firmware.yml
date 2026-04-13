@@ -1,0 +1,178 @@
+name: Build RCP Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      idf_version:
+        description: "ESP-IDF version tag (e.g. v5.5.4)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Resolve IDF version
+        id: idf_ver
+        run: |
+          VERSION="${{ github.event.inputs.idf_version }}"
+          if [ -z "$VERSION" ]; then
+            echo "No idf_version provided — triggered without a version input."
+            echo "Use workflow_dispatch with idf_version, or trigger via check-idf-release.yml."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists for this IDF version
+        id: release_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="rcp-${{ steps.idf_ver.outputs.version }}"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists — nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No release for $TAG — proceeding with build."
+          fi
+
+      - name: Checkout ESP-IDF
+        if: steps.release_check.outputs.exists == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: espressif/esp-idf
+          ref: ${{ steps.idf_ver.outputs.version }}
+          path: esp-idf
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install ESP-IDF prerequisites
+        if: steps.release_check.outputs.exists == 'false'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git cmake ninja-build wget flex bison gperf \
+            python3 python3-pip python3-venv \
+            libffi-dev libssl-dev dfu-util libusb-1.0-0
+
+      - name: Install ESP-IDF tools (esp32h2 only)
+        if: steps.release_check.outputs.exists == 'false'
+        working-directory: esp-idf
+        run: |
+          ./install.sh esp32h2
+
+      - name: Build ot_rcp for esp32h2
+        if: steps.release_check.outputs.exists == 'false'
+        working-directory: esp-idf/examples/openthread/ot_rcp
+        run: |
+          . $GITHUB_WORKSPACE/esp-idf/export.sh
+          idf.py set-target esp32h2
+          idf.py build 2>&1 | tee /tmp/rcp-build.log
+
+      - name: Extract version string and locate binary
+        if: steps.release_check.outputs.exists == 'false'
+        id: rcp_version
+        run: |
+          BUILD_DIR="$GITHUB_WORKSPACE/esp-idf/examples/openthread/ot_rcp/build"
+
+          # Find the app binary — IDF names it after the project, but locate defensively
+          BIN=$(find "$BUILD_DIR" -maxdepth 1 -name "*.bin" ! -name "bootloader.bin" ! -name "*partition*" | head -1)
+          if [ -z "$BIN" ]; then
+            echo "ERROR: no app binary found in $BUILD_DIR"
+            ls -lh "$BUILD_DIR" || true
+            exit 1
+          fi
+          echo "Found binary: $BIN"
+          echo "bin_path=$BIN" >> "$GITHUB_OUTPUT"
+
+          # Pull OT version string baked into the binary (grep binary-safe)
+          OT_VER=$(strings -n 10 "$BIN" | grep -oP 'openthread-esp32/\S+' | head -1 || true)
+
+          IDF_COMMIT=$(git -C "$GITHUB_WORKSPACE/esp-idf" rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +"%Y-%m-%d")
+
+          if [ -n "$OT_VER" ]; then
+            echo "ot_version=$OT_VER" >> "$GITHUB_OUTPUT"
+          else
+            echo "ot_version=openthread-esp32/unknown-${IDF_COMMIT}" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "idf_commit=$IDF_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+
+          echo "--- Version info ---"
+          echo "Binary     : $BIN"
+          echo "OT version : $OT_VER"
+          echo "IDF commit : $IDF_COMMIT"
+          echo "Release tag: ${{ steps.release_check.outputs.release_tag }}"
+
+      - name: Stage release artifacts
+        if: steps.release_check.outputs.exists == 'false'
+        run: |
+          mkdir -p /tmp/rcp-release
+          cp "${{ steps.rcp_version.outputs.bin_path }}" /tmp/rcp-release/ot_rcp_esp32h2.bin
+
+          # version.json — fetched by the component to compare against live device
+          cat > /tmp/rcp-release/version.json <<EOF
+          {
+            "idf_version": "${{ steps.idf_ver.outputs.version }}",
+            "idf_commit": "${{ steps.rcp_version.outputs.idf_commit }}",
+            "ot_version": "${{ steps.rcp_version.outputs.ot_version }}",
+            "target": "esp32h2",
+            "build_date": "${{ steps.rcp_version.outputs.build_date }}",
+            "release_tag": "${{ steps.release_check.outputs.release_tag }}"
+          }
+          EOF
+
+          echo "--- Artifacts ---"
+          ls -lh /tmp/rcp-release/
+
+      - name: Create GitHub Release
+        if: steps.release_check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.release_check.outputs.release_tag }}"
+          IDF_VER="${{ steps.idf_ver.outputs.version }}"
+          OT_VER="${{ steps.rcp_version.outputs.ot_version }}"
+          BUILD_DATE="${{ steps.rcp_version.outputs.build_date }}"
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "RCP Firmware ${IDF_VER}" \
+            --notes "## ESP32-H2 RCP Firmware
+
+          Built from ESP-IDF \`${IDF_VER}\` for the \`esp32h2\` Radio Co-Processor.
+
+          | Field | Value |
+          |-------|-------|
+          | ESP-IDF version | \`${IDF_VER}\` |
+          | OpenThread version | \`${OT_VER}\` |
+          | Target | \`esp32h2\` |
+          | Build date | \`${BUILD_DATE}\` |
+
+          ### Files
+          - \`ot_rcp_esp32h2.bin\` — raw RCP firmware, flash at \`0x0\` on the H2
+          - \`version.json\` — machine-readable metadata for \`thread_border_router\` component auto-update
+
+          ### Flashing manually
+          \`\`\`bash
+          esptool.py --port /dev/ttyUSB1 --chip esp32h2 write_flash 0x0 ot_rcp_esp32h2.bin
+          \`\`\`" \
+            /tmp/rcp-release/ot_rcp_esp32h2.bin \
+            /tmp/rcp-release/version.json
+
+          echo "Released: $TAG"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rcp-build-log
+          path: /tmp/rcp-build.log
+          retention-days: 7
