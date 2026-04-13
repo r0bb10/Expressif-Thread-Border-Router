@@ -154,8 +154,8 @@ jobs:
                   "nvs,        data, nvs,      , 0x6000,\n"
                   "otadata,    data, ota,      , 0x2000,\n"
                   "phy_init,   data, phy,      , 0x1000,\n"
-                  "ota_0,      app,  ota_0,    , 1724K,\n"
-                  "ota_1,      app,  ota_1,    , 1724K,\n"
+                  "ota_0,      app,  ota_0,    , 1600K,\n"
+                  "ota_1,      app,  ota_1,    , 1600K,\n"
                   "web_storage,data, spiffs,   , 200K,\n"
                   "rcp_fw,     data, spiffs,   , 320K,\n"
               )
