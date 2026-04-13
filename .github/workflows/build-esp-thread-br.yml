@@ -210,9 +210,6 @@ jobs:
           cp "$build_dir/rcp_fw.bin" "$split_dir/"
           cp "$build_dir/flasher_args.json" "$split_dir/"
 
-          cp "$build_dir/esp_ot_br.bin" "$single_dir/esp_ot_br.bin"
-          cp "$build_dir/flasher_args.json" "$single_dir/"
-
           python3 - <<'PY'
           import json
           import pathlib
@@ -221,7 +218,7 @@ jobs:
 
           dist_dir = pathlib.Path("dist")
           build_dir = pathlib.Path("esp-thread-br-src/examples/basic_thread_border_router/build")
-          single_bin = dist_dir / "single" / "esp_ot_br_single_flash.bin"
+          single_bin = dist_dir / "single" / "esp_ot_br_full.bin"
           flasher_args = json.loads((build_dir / "flasher_args.json").read_text())
           flash_files = sorted(flasher_args["flash_files"].items(), key=lambda item: int(item[0], 16))
 
@@ -277,11 +274,11 @@ jobs:
 
           ### Artifacts
           - \`${TAG}-split.tar.gz\` — split binaries for manual flashing
-          - \`${TAG}-single.tar.gz\` — single merged flash image
+          - \`${TAG}-single.tar.gz\` — single merged flash image (\`esp_ot_br_full.bin\`)
 
           ### Flashing (single image)
           \`\`\`bash
-          esptool.py --chip esp32s3 --port /dev/ttyUSB0 write_flash 0x0 esp_ot_br_single_flash.bin
+          esptool.py --chip esp32s3 --port /dev/ttyUSB0 write_flash 0x0 esp_ot_br_full.bin
           \`\`\`
 
           ### Flashing (split)
@@ -292,7 +289,24 @@ jobs:
 
           ### OTA / RCP Update
           The RCP image is packed into the border router firmware and will be auto-updated on boot.
-          For OTA usage, see the ESP Thread BR docs for running the local OTA server.
+
+          **OTA update (from a Linux host):**
+          1. Start an HTTPS server that serves the OTA image:
+          \`\`\`bash
+          openssl s_server -WWW -key ca_key.pem -cert ca_cert.pem -port 8070
+          \`\`\`
+          2. Trigger the OTA download from the border router:
+          \`\`\`bash
+          ot ota download https://\${HOST_URL}:8070/ota_with_rcp_image
+          \`\`\`
+
+          Notes:
+          - OTA requires access to the RCP RESET and BOOT pins.
+          - The certificate must be trusted by the border router (add the public key if self-signed).
+
+          References:
+          - https://docs.espressif.com/projects/esp-thread-br/en/latest/dev-guide/ota_update.html
+          - https://docs.espressif.com/projects/esp-thread-br/en/latest/dev-guide/rcp_update.html
           EOF
 
           mv "$GITHUB_WORKSPACE/dist/esp-thread-br-${FLASH_SIZE}-${MODE}-split.tar.gz" "$GITHUB_WORKSPACE/dist/${TAG}-split.tar.gz"
