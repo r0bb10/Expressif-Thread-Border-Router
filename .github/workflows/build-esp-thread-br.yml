@@ -6,35 +6,83 @@ on:
       idf_ref:
         description: "ESP-IDF ref to build against (for example: v5.5.4, release/v6.0, v6.0)"
         required: true
-      flash_size:
-        description: "Flash size for the ESP32-S3 host"
-        required: true
-        type: choice
-        options:
-          - "4mb"
-          - "8mb"
-        default: "8mb"
-      mode:
-        description: "Host network mode"
-        required: true
-        type: choice
-        options:
-          - "wifi"
-          - "ethernet"
-        default: "wifi"
 
 permissions:
   contents: write
 
 jobs:
-  build_release:
+  prepare_metadata:
     runs-on: ubuntu-latest
+    outputs:
+      br_commit: ${{ steps.meta.outputs.br_commit }}
+      br_ref: ${{ steps.meta.outputs.br_ref }}
+      idf_commit: ${{ steps.meta.outputs.idf_commit }}
+      build_date: ${{ steps.meta.outputs.build_date }}
+      tag: ${{ steps.meta.outputs.tag }}
+      title: ${{ steps.meta.outputs.title }}
 
     steps:
       - name: Checkout workflow repo
         uses: actions/checkout@v5
         with:
-          ref: main
+          fetch-depth: 1
+
+      - name: Clone ESP-IDF
+        env:
+          IDF_REF: ${{ inputs.idf_ref }}
+        run: |
+          git clone --recursive --depth 1 --branch "$IDF_REF" https://github.com/espressif/esp-idf.git "$GITHUB_WORKSPACE/esp-idf"
+
+      - name: Clone ESP Thread BR
+        run: |
+          git clone --recursive --depth 1 https://github.com/espressif/esp-thread-br.git "$GITHUB_WORKSPACE/esp-thread-br"
+
+      - name: Collect release metadata
+        id: meta
+        env:
+          IDF_REF: ${{ inputs.idf_ref }}
+        run: |
+          set -euo pipefail
+
+          BR_COMMIT=$(git -C "$GITHUB_WORKSPACE/esp-thread-br" rev-parse --short HEAD)
+          BR_REF=$(git -C "$GITHUB_WORKSPACE/esp-thread-br" describe --tags --always)
+          IDF_COMMIT=$(git -C "$GITHUB_WORKSPACE/esp-idf" rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +"%Y-%m-%d")
+          BUILD_STAMP=$(date -u +"%Y%m%dT%H%M%SZ")
+          TAG="esp-thread-br-${BUILD_STAMP}-${BR_COMMIT}"
+          TITLE="ESP Thread BR ${BUILD_DATE} ${BR_COMMIT}"
+
+          echo "br_commit=$BR_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "br_ref=$BR_REF" >> "$GITHUB_OUTPUT"
+          echo "idf_commit=$IDF_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+
+  build_release:
+    needs: prepare_metadata
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flash_size: "8mb"
+            mode: "wifi"
+            asset_name: "esp-thread-br-8mb-wifi.bin"
+          - flash_size: "8mb"
+            mode: "ethernet"
+            asset_name: "esp-thread-br-8mb-ethernet.bin"
+          - flash_size: "4mb"
+            mode: "wifi"
+            asset_name: "esp-thread-br-4mb-wifi.bin"
+          - flash_size: "4mb"
+            mode: "ethernet"
+            asset_name: "esp-thread-br-4mb-ethernet.bin"
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v5
+        with:
           fetch-depth: 1
 
       - name: Install host dependencies
@@ -55,9 +103,7 @@ jobs:
             python3 \
             python3-pip \
             python3-venv \
-            zip \
-            xz-utils \
-            tar
+            xz-utils
 
       - name: Clone ESP-IDF
         env:
@@ -70,32 +116,55 @@ jobs:
         run: |
           git clone --recursive --depth 1 https://github.com/espressif/esp-thread-br.git "$GITHUB_WORKSPACE/esp-thread-br"
 
-      - name: Stage clean build tree (no git metadata)
-        id: stage
+      - name: Stage clean build tree
         run: |
           set -euo pipefail
           workdir="$GITHUB_WORKSPACE/esp-thread-br-src"
           rm -rf "$workdir"
           mkdir -p "$workdir"
           git -C "$GITHUB_WORKSPACE/esp-thread-br" archive --format=tar HEAD | tar -C "$workdir" -xf -
-          echo "workdir=$workdir" >> "$GITHUB_OUTPUT"
 
       - name: Patch example configuration
         env:
-          FLASH_SIZE: ${{ inputs.flash_size }}
-          MODE: ${{ inputs.mode }}
+          FLASH_SIZE: ${{ matrix.flash_size }}
+          MODE: ${{ matrix.mode }}
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import os
+          import re
 
           workdir = Path(os.environ["GITHUB_WORKSPACE"]) / "esp-thread-br-src"
           project_dir = workdir / "examples" / "basic_thread_border_router"
           sdkconfig_path = project_dir / "sdkconfig.defaults"
+          source_path = project_dir / "main" / "esp_ot_br.c"
+          version_cmake = Path(os.environ["GITHUB_WORKSPACE"]) / "esp-idf" / "tools" / "cmake" / "version.cmake"
 
           flash_size = os.environ["FLASH_SIZE"]
           mode = os.environ["MODE"]
-          enable_web_ap = True
+
+          version_matches = dict(
+              re.findall(r"set\(IDF_VERSION_(MAJOR|MINOR|PATCH)\s+(\d+)\)", version_cmake.read_text())
+          )
+          major, minor, patch = (int(version_matches[key]) for key in ("MAJOR", "MINOR", "PATCH"))
+          source = source_path.read_text()
+          hostname_match = re.search(r'mdns_hostname_set\("([^"]+)"\)', source)
+          if not hostname_match:
+              raise RuntimeError(f"Could not extract upstream mDNS hostname from {source_path}")
+          upstream_hostname = hostname_match.group(1)
+
+          if major >= 6:
+              ipv6_num_addresses = 12
+          elif major == 5 and minor >= 4:
+              ipv6_num_addresses = 12
+          elif major == 5 and minor == 3 and patch >= 1:
+              ipv6_num_addresses = 12
+          elif major == 5 and minor == 2 and patch >= 3:
+              ipv6_num_addresses = 12
+          elif major == 5 and minor == 1 and patch >= 5:
+              ipv6_num_addresses = 12
+          else:
+              ipv6_num_addresses = 8
 
           lines = sdkconfig_path.read_text().splitlines()
 
@@ -109,7 +178,6 @@ jobs:
                   kept.append(line)
               return kept
 
-          # Remove existing flash size and connection mode selections.
           lines = drop_prefix([
               "CONFIG_ESPTOOLPY_FLASHSIZE_",
               "CONFIG_EXAMPLE_CONNECT_WIFI=",
@@ -120,6 +188,7 @@ jobs:
               "CONFIG_OPENTHREAD_BR_START_WEB=",
               "CONFIG_OPENTHREAD_BR_SOFTAP_SETUP=",
               "CONFIG_LWIP_IPV6_NUM_ADDRESSES=",
+              "CONFIG_LWIP_LOCAL_HOSTNAME=",
           ])
 
           if flash_size == "4mb":
@@ -134,16 +203,14 @@ jobs:
               lines.append("CONFIG_EXAMPLE_CONNECT_WIFI=y")
               lines.append("# CONFIG_EXAMPLE_CONNECT_ETHERNET is not set")
 
-          # Always enable auto-start and web UI.
           lines.append("CONFIG_OPENTHREAD_BR_AUTO_START=y")
           lines.append("CONFIG_OPENTHREAD_BR_START_WEB=y")
 
-          # Only enable SoftAP setup for Wi-Fi mode.
           if mode != "ethernet":
               lines.append("CONFIG_OPENTHREAD_BR_SOFTAP_SETUP=y")
 
-          # Required for recent IDF releases per docs.
-          lines.append("CONFIG_LWIP_IPV6_NUM_ADDRESSES=12")
+          lines.append(f"CONFIG_LWIP_IPV6_NUM_ADDRESSES={ipv6_num_addresses}")
+          lines.append(f'CONFIG_LWIP_LOCAL_HOSTNAME="{upstream_hostname}"')
 
           sdkconfig_path.write_text("\n".join(lines) + "\n")
 
@@ -161,7 +228,7 @@ jobs:
               )
           PY
 
-      - name: Build the RCP image for the selected IDF
+      - name: Build the RCP image
         env:
           IDF_PATH: ${{ github.workspace }}/esp-idf
         run: |
@@ -173,22 +240,21 @@ jobs:
       - name: Build the border router image
         env:
           IDF_PATH: ${{ github.workspace }}/esp-idf
+          ESP_THREAD_BR_VER: ${{ needs.prepare_metadata.outputs.br_ref }}
         run: |
           set -euo pipefail
           source "$IDF_PATH/export.sh"
 
-          ESP_THREAD_BR_VER=$(git -C "$GITHUB_WORKSPACE/esp-thread-br" describe --tags --always)
           export EXTRA_CMAKE_ARGS="-DPROJECT_VER=${ESP_THREAD_BR_VER}"
 
           cd "$GITHUB_WORKSPACE/esp-thread-br-src/examples/basic_thread_border_router"
           idf.py set-target esp32s3
           idf.py fullclean build
 
-      - name: Package split and single-flash archives
+      - name: Package merged binary
         env:
           IDF_PATH: ${{ github.workspace }}/esp-idf
-          FLASH_SIZE: ${{ inputs.flash_size }}
-          MODE: ${{ inputs.mode }}
+          ASSET_NAME: ${{ matrix.asset_name }}
         run: |
           set -euo pipefail
 
@@ -197,139 +263,112 @@ jobs:
           project_dir="$GITHUB_WORKSPACE/esp-thread-br-src/examples/basic_thread_border_router"
           build_dir="$project_dir/build"
           dist_dir="$GITHUB_WORKSPACE/dist"
-          split_dir="$dist_dir/split"
-          single_dir="$dist_dir/single"
 
-          mkdir -p "$split_dir" "$single_dir"
-
-          cp "$build_dir/bootloader/bootloader.bin" "$split_dir/"
-          cp "$build_dir/partition_table/partition-table.bin" "$split_dir/"
-          cp "$build_dir/ota_data_initial.bin" "$split_dir/"
-          cp "$build_dir/esp_ot_br.bin" "$split_dir/"
-          cp "$build_dir/web_storage.bin" "$split_dir/"
-          cp "$build_dir/rcp_fw.bin" "$split_dir/"
-          cp "$build_dir/flasher_args.json" "$split_dir/"
+          mkdir -p "$dist_dir"
 
           python3 - <<'PY'
           import json
+          import os
           import pathlib
           import subprocess
           import sys
 
-          dist_dir = pathlib.Path("dist")
-          build_dir = pathlib.Path("esp-thread-br-src/examples/basic_thread_border_router/build")
-          single_bin = dist_dir / "single" / "esp_ot_br_full.bin"
+          build_dir = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "esp-thread-br-src" / "examples" / "basic_thread_border_router" / "build"
+          dist_dir = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "dist"
+          asset_name = os.environ["ASSET_NAME"]
+          output_path = dist_dir / asset_name
+
           flasher_args = json.loads((build_dir / "flasher_args.json").read_text())
           flash_files = sorted(flasher_args["flash_files"].items(), key=lambda item: int(item[0], 16))
 
-          command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "merge_bin", "-o", str(single_bin)]
+          command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "merge_bin", "-o", str(output_path)]
           for offset, relative_path in flash_files:
               command.extend([offset, str(build_dir / relative_path)])
 
           subprocess.run(command, check=True)
           PY
 
-          base="esp-thread-br-${FLASH_SIZE}-${MODE}"
-          tar -czf "$dist_dir/${base}-split.tar.gz" -C "$split_dir" .
-          tar -czf "$dist_dir/${base}-single.tar.gz" -C "$single_dir" .
-
-          sha256sum "$dist_dir/${base}-split.tar.gz" > "$dist_dir/${base}-split.tar.gz.sha256"
-          md5sum "$dist_dir/${base}-split.tar.gz" > "$dist_dir/${base}-split.tar.gz.md5"
-          sha256sum "$dist_dir/${base}-single.tar.gz" > "$dist_dir/${base}-single.tar.gz.sha256"
-          md5sum "$dist_dir/${base}-single.tar.gz" > "$dist_dir/${base}-single.tar.gz.md5"
-
+          sha256sum "$dist_dir/$ASSET_NAME" > "$dist_dir/$ASSET_NAME.sha256"
           ls -lah "$dist_dir"
 
-      - name: Prepare release metadata
-        id: meta
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            dist/${{ matrix.asset_name }}
+            dist/${{ matrix.asset_name }}.sha256
+
+  publish_release:
+    needs:
+      - prepare_metadata
+      - build_release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: esp-thread-br-*.bin
+          merge-multiple: true
+          path: dist
+
+      - name: Prepare release notes
         env:
           IDF_REF: ${{ inputs.idf_ref }}
-          FLASH_SIZE: ${{ inputs.flash_size }}
-          MODE: ${{ inputs.mode }}
+          IDF_COMMIT: ${{ needs.prepare_metadata.outputs.idf_commit }}
+          BR_REF: ${{ needs.prepare_metadata.outputs.br_ref }}
+          BR_COMMIT: ${{ needs.prepare_metadata.outputs.br_commit }}
+          BUILD_DATE: ${{ needs.prepare_metadata.outputs.build_date }}
         run: |
           set -euo pipefail
-
-          BR_COMMIT=$(git -C "$GITHUB_WORKSPACE/esp-thread-br" rev-parse --short HEAD)
-          BR_REF=$(git -C "$GITHUB_WORKSPACE/esp-thread-br" describe --tags --always)
-          IDF_COMMIT=$(git -C "$GITHUB_WORKSPACE/esp-idf" rev-parse --short HEAD)
-          BUILD_DATE=$(date -u +"%Y-%m-%d")
-
-          TAG="br-${IDF_REF}-${BR_REF}-${FLASH_SIZE}-${MODE}"
-          TAG="${TAG//\//-}"
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "br_commit=$BR_COMMIT" >> "$GITHUB_OUTPUT"
-          echo "br_ref=$BR_REF" >> "$GITHUB_OUTPUT"
-          echo "idf_commit=$IDF_COMMIT" >> "$GITHUB_OUTPUT"
-          echo "build_date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
 
           cat > "$GITHUB_WORKSPACE/dist/release_notes.md" <<EOF
           ## ESP Thread Border Router Release
 
           **ESP-IDF ref**: \`${IDF_REF}\` (\`${IDF_COMMIT}\`)
           **esp-thread-br ref**: \`${BR_REF}\` (\`${BR_COMMIT}\`)
-          **Flash size**: \`${FLASH_SIZE}\`
-          **Mode**: \`${MODE}\`
           **Build date**: \`${BUILD_DATE}\`
 
-          ### Artifacts
-          - \`${TAG}-split.tar.gz\` — split binaries for manual flashing
-          - \`${TAG}-single.tar.gz\` — single merged flash image (\`esp_ot_br_full.bin\`)
+          ### Assets
+          - \`esp-thread-br-8mb-wifi.bin\`
+          - \`esp-thread-br-8mb-wifi.bin.sha256\`
+          - \`esp-thread-br-8mb-ethernet.bin\`
+          - \`esp-thread-br-8mb-ethernet.bin.sha256\`
+          - \`esp-thread-br-4mb-wifi.bin\`
+          - \`esp-thread-br-4mb-wifi.bin.sha256\`
+          - \`esp-thread-br-4mb-ethernet.bin\`
+          - \`esp-thread-br-4mb-ethernet.bin.sha256\`
 
-          ### Flashing (single image)
+          ### Flashing
           \`\`\`bash
-          esptool.py --chip esp32s3 --port /dev/ttyUSB0 write_flash 0x0 esp_ot_br_full.bin
+          esptool.py --chip esp32s3 --port /dev/ttyUSB0 write_flash 0x0 esp-thread-br-8mb-wifi.bin
           \`\`\`
-
-          ### Flashing (split)
-          \`\`\`bash
-          esptool.py --chip esp32s3 --port /dev/ttyUSB0 \\
-            write_flash @flasher_args.json
-          \`\`\`
-
-          ### OTA / RCP Update
-          The RCP image is packed into the border router firmware and will be auto-updated on boot.
-
-          **OTA update (from a Linux host):**
-          1. Start an HTTPS server that serves the OTA image:
-          \`\`\`bash
-          openssl s_server -WWW -key ca_key.pem -cert ca_cert.pem -port 8070
-          \`\`\`
-          2. Trigger the OTA download from the border router:
-          \`\`\`bash
-          ot ota download https://\${HOST_URL}:8070/ota_with_rcp_image
-          \`\`\`
-
-          Notes:
-          - OTA requires access to the RCP RESET and BOOT pins.
-          - The certificate must be trusted by the border router (add the public key if self-signed).
-
-          References:
-          - https://docs.espressif.com/projects/esp-thread-br/en/latest/dev-guide/ota_update.html
-          - https://docs.espressif.com/projects/esp-thread-br/en/latest/dev-guide/rcp_update.html
           EOF
 
-          mv "$GITHUB_WORKSPACE/dist/esp-thread-br-${FLASH_SIZE}-${MODE}-split.tar.gz" "$GITHUB_WORKSPACE/dist/${TAG}-split.tar.gz"
-          mv "$GITHUB_WORKSPACE/dist/esp-thread-br-${FLASH_SIZE}-${MODE}-single.tar.gz" "$GITHUB_WORKSPACE/dist/${TAG}-single.tar.gz"
-          mv "$GITHUB_WORKSPACE/dist/esp-thread-br-${FLASH_SIZE}-${MODE}-split.tar.gz.sha256" "$GITHUB_WORKSPACE/dist/${TAG}-split.tar.gz.sha256"
-          mv "$GITHUB_WORKSPACE/dist/esp-thread-br-${FLASH_SIZE}-${MODE}-split.tar.gz.md5" "$GITHUB_WORKSPACE/dist/${TAG}-split.tar.gz.md5"
-          mv "$GITHUB_WORKSPACE/dist/esp-thread-br-${FLASH_SIZE}-${MODE}-single.tar.gz.sha256" "$GITHUB_WORKSPACE/dist/${TAG}-single.tar.gz.sha256"
-          mv "$GITHUB_WORKSPACE/dist/esp-thread-br-${FLASH_SIZE}-${MODE}-single.tar.gz.md5" "$GITHUB_WORKSPACE/dist/${TAG}-single.tar.gz.md5"
-
-      - name: Create GitHub Release
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare_metadata.outputs.tag }}
+          TITLE: ${{ needs.prepare_metadata.outputs.title }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.meta.outputs.tag }}"
 
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "ESP Thread BR ${TAG}" \
-            --notes-file "$GITHUB_WORKSPACE/dist/release_notes.md" \
-            "$GITHUB_WORKSPACE/dist/${TAG}-split.tar.gz" \
-            "$GITHUB_WORKSPACE/dist/${TAG}-split.tar.gz.sha256" \
-            "$GITHUB_WORKSPACE/dist/${TAG}-split.tar.gz.md5" \
-            "$GITHUB_WORKSPACE/dist/${TAG}-single.tar.gz" \
-            "$GITHUB_WORKSPACE/dist/${TAG}-single.tar.gz.sha256" \
-            "$GITHUB_WORKSPACE/dist/${TAG}-single.tar.gz.md5"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" \
+              --notes-file "$GITHUB_WORKSPACE/dist/release_notes.md"
+            gh release upload "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber \
+              "$GITHUB_WORKSPACE"/dist/*.bin \
+              "$GITHUB_WORKSPACE"/dist/*.sha256
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" \
+              --notes-file "$GITHUB_WORKSPACE/dist/release_notes.md" \
+              "$GITHUB_WORKSPACE"/dist/*.bin \
+              "$GITHUB_WORKSPACE"/dist/*.sha256
+          fi
