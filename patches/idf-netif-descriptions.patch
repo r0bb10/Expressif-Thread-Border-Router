@@ -1,0 +1,15 @@
+diff --git a/examples/common_components/protocol_examples_common/include/protocol_examples_common.h b/examples/common_components/protocol_examples_common/include/protocol_examples_common.h
+index b023a240cc6..a285164eb7 100644
+--- a/examples/common_components/protocol_examples_common/include/protocol_examples_common.h
++++ b/examples/common_components/protocol_examples_common/include/protocol_examples_common.h
+@@ -25,8 +25,8 @@
+ #if !CONFIG_IDF_TARGET_LINUX
+ #if CONFIG_EXAMPLE_CONNECT_WIFI
+-#define EXAMPLE_NETIF_DESC_STA "example_netif_sta"
++#define EXAMPLE_NETIF_DESC_STA "wifi_sta"
+ #endif
+ 
+ #if CONFIG_EXAMPLE_CONNECT_ETHERNET
+-#define EXAMPLE_NETIF_DESC_ETH "example_netif_eth"
++#define EXAMPLE_NETIF_DESC_ETH "ethernet"
+ #endif
